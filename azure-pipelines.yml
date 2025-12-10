@@ -1,0 +1,155 @@
+# .azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+variables:
+  # Ajuste conforme necessário
+  terraformVersion: '1.5.7'              # versão do Terraform a usar
+  workingDirectory: 'Infra'        # onde está o código Terraform 
+  azureServiceConnection: 'AzureDevOps-Connection' # <--- o nome do service connection aqui
+  tfvarsFile: 'terraform.tfvars'         # se usar outro nome (ex: dev.tfvars) ajuste aqui
+  planFile: 'tfplan'                     # nome do plan gerado
+  environmentName: 'staging'             # nome do environment no Azure DevOps (usado para approvals)
+
+stages:
+- stage: Plan
+  displayName: 'Init / Validate / Plan'
+  jobs:
+  - job: Terraform_Plan
+    displayName: 'Terraform: init, validate, plan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+
+    - task: UsePythonVersion@0
+      displayName: 'ensure python for azure cli if needed'
+      inputs:
+        versionSpec: '3.x'
+
+    - task: AzureCLI@2
+      displayName: 'Install Terraform'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          echo "Installing Terraform ${TERRAFORM_VERSION:-$(terraformVersion)}..."
+          TERRAFORM_VERSION=${TERRAFORM_VERSION:-$(terraformVersion)}
+          curl -sSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          unzip -o /tmp/terraform.zip -d /usr/local/bin
+          terraform -version
+
+    - script: |
+        set -e
+        cd $(workingDirectory)
+        echo "Working dir: $(pwd)"
+        # init (no backend block changes here; assumes local state or backend in code)
+        terraform init -input=false
+        terraform fmt -recursive
+        terraform validate
+      displayName: 'Terraform init / fmt / validate'
+      workingDirectory: $(workingDirectory)
+
+    - script: |
+        set -e
+        cd $(workingDirectory)
+        # create plan
+        if [ -f "$(tfvarsFile)" ]; then
+          terraform plan -input=false -out=$(planFile) -var-file="$(tfvarsFile)"
+        else
+          terraform plan -input=false -out=$(planFile)
+        fi
+        # export json plan for review and publish
+        terraform show -json $(planFile) > $(planFile).json || true
+        ls -la
+      displayName: 'Terraform plan and export'
+      workingDirectory: $(workingDirectory)
+
+    - publish: $(workingDirectory)/$(planFile).json
+      artifact: terraform-plan
+      displayName: 'Publish terraform plan (JSON)'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish plan binary artifact'
+      inputs:
+        targetPath: '$(workingDirectory)/$(planFile)'
+        artifactName: 'tfplan'
+        publishLocation: 'pipeline'
+
+- stage: Apply
+  displayName: 'Apply (manual approval required)'
+  dependsOn: Plan
+  condition: succeeded()
+  jobs:
+  - deployment: Terraform_Apply
+    displayName: 'Apply Terraform plan after approval'
+    environment: $(environmentName)   # configure approvals for this environment in Azure DevOps portal
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - checkout: self
+            persistCredentials: true
+
+          - task: AzureCLI@2
+            displayName: 'Install Terraform'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                TERRAFORM_VERSION=${TERRAFORM_VERSION:-$(terraformVersion)}
+                echo "Installing Terraform ${TERRAFORM_VERSION}..."
+                curl -sSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                unzip -o /tmp/terraform.zip -d /usr/local/bin
+                terraform -version
+
+          - download: current
+            artifact: tfplan
+            displayName: 'Download tfplan artifact'
+
+          - script: |
+              set -e
+              cd $(workingDirectory)
+              echo "Applying terraform plan file from artifact..."
+              # if plan file is binary we expect it at the root of workingDirectory via artifact download
+              if [ -f "$(System.DefaultWorkingDirectory)/tfplan/$(planFile)" ]; then
+                cp "$(System.DefaultWorkingDirectory)/tfplan/$(planFile)" ./
+                terraform apply -input=false -auto-approve $(planFile)
+              elif [ -f "$(System.DefaultWorkingDirectory)/terraform-plan/$(planFile).json" ]; then
+                echo "Plan JSON exists (for review), but apply requires binary plan; recreating plan and applying..."
+                if [ -f "$(tfvarsFile)" ]; then
+                  terraform plan -input=false -out=$(planFile) -var-file="$(tfvarsFile)"
+                else
+                  terraform plan -input=false -out=$(planFile)
+                fi
+                terraform apply -input=false -auto-approve $(planFile)
+              else
+                echo "No plan artifact found. Creating plan and applying..."
+                if [ -f "$(tfvarsFile)" ]; then
+                  terraform plan -input=false -out=$(planFile) -var-file="$(tfvarsFile)"
+                else
+                  terraform plan -input=false -out=$(planFile)
+                fi
+                terraform apply -input=false -auto-approve $(planFile)
+              fi
+            displayName: 'Apply Terraform plan'
+            workingDirectory: $(workingDirectory)
+
+          - script: |
+              echo "Terraform apply finished. Showing outputs..."
+              cd $(workingDirectory)
+              terraform output || true
+            displayName: 'Show outputs'
